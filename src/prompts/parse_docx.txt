@@ -1,0 +1,23 @@
+请仔细阅读以下剧本内容，提取并整理出结构化的剧本信息，以严格的 JSON 格式返回：
+
+返回格式要求：
+{
+  "title": "剧本标题",
+  "episode_info": "第X集",
+  "characters": [
+    {"name": "人物名称", "role": "角色定位", "description": "外貌和性格描述"}
+  ],
+  "scenes": [
+    {"scene_id": "scene_1", "name": "场景名称", "location": "地点", "time_of_day": "白天/夜晚/黄昏等", "description": "场景描述"}
+  ],
+  "props": [
+    {"name": "道具名称", "description": "道具描述"}
+  ],
+  "content_by_scene": [
+    {"scene_id": "scene_1", "dialogues": [{"speaker": "说话人", "text": "对话内容", "type": "dialogue/narration/action"}]}
+  ],
+  "summary": "100字以内的剧情摘要"
+}
+
+剧本内容：
+{{ script_content }}

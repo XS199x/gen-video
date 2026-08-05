@@ -1,0 +1,74 @@
+api_keys:
+  deepseek: ${DEEPSEEK_API_KEY}
+  openai: ${OPENAI_API_KEY}      # 用于图片生成 (DALL-E)
+  kling: ${KLING_API_KEY}
+
+image:
+  provider: jimeng
+  jimeng:
+    # 在火山引擎控制台获取: https://console.volcengine.com/iam/keymanage/
+    access_key: ${VOLCENGINE_AK}
+    secret_key: ${VOLCENGINE_SK}
+    model: jimeng_t2i_v30  # jimeng_t2i_v30 或 jimeng_seedream46_cvtob
+    size: 1024x1024        # 1024x1024, 1328x1328, 2048x2048, 1280x720, 1920x1080
+    max_retries: 3
+    retry_delay: 5
+    timeout: 120
+  # 如需切换 DALL-E:
+  # provider: openai
+  # openai:
+  #   model: dall-e-3
+  #   size: 1024x1024
+
+global:
+  log_level: INFO
+  output_base_dir: ./outputs
+  # input_dir: ./参考资料  # 可选：指定输入文件所在目录
+  cache:
+    enabled: true
+    dir: ./.cache/llm
+    max_entries: 500
+
+models:
+  default:
+    model: deepseek-chat      # deepseek-chat (V3) 或 deepseek-reasoner (R1)
+    provider: deepseek
+    temperature: 0.5
+  nodes:
+    # 可以为每个节点单独指定模型
+    # parse_docx:
+    #   model: deepseek-chat
+    #   provider: deepseek
+    # generate_asset_package:
+    #   model: gpt-4o
+    #   provider: openai
+    # step1_storyboard:
+    #   model: gpt-4o
+    #   provider: openai
+    # step2_consistency:
+    #   model: gpt-4o-mini
+    #   provider: openai
+    # step3_optimize_prompts:
+    #   model: gpt-4o
+    #   provider: openai
+    generate_videos:
+      video_provider: kling
+      video_model: kling-v1
+      video_duration: 5
+      # video_api_key: your-key-here  # 可选，优先于环境变量 KLING_API_KEY
+
+prompt_templates:
+  parse_docx: src/prompts/parse_docx.txt
+  generate_asset_package: src/prompts/generate_asset_package.txt
+  step1_storyboard: src/prompts/step1_storyboard.txt
+  step2_consistency: src/prompts/step2_consistency.txt
+  step3_optimize_prompts: src/prompts/step3_optimize_prompts.txt
+
+workflow_order:
+  - parse_docx
+  - generate_asset_package
+  - step1_storyboard
+  - step2_consistency
+  - step3_optimize_prompts
+  - generate_videos
+  - merge_videos

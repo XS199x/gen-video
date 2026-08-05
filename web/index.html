@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>短剧生成工作流</title>
+    <link rel="stylesheet" href="/css/style.css?v=2">
+</head>
+<body>
+    <div class="app-shell">
+        <header class="app-header">
+            <h1>🎬 短剧生成工作流</h1>
+            <nav>
+                <a href="#setup">⚙️ 配置</a>
+                <a href="#projects">📂 项目</a>
+            </nav>
+        </header>
+        <main class="app-main" id="view-container">
+            <div class="text-center" style="padding:80px 20px;">
+                <span class="spinner spinner-dark" style="width:32px;height:32px;"></span>
+                <p class="text-muted mt-4">加载中...</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="/js/api.js?v=2"></script>
+    <script src="/js/router.js?v=2"></script>
+    <script src="/js/views/setup.js?v=2"></script>
+    <script src="/js/views/projects.js?v=2"></script>
+    <script src="/js/views/workflow.js?v=2"></script>
+    <script src="/js/app.js?v=2"></script>
+</body>
+</html>
