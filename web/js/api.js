@@ -60,8 +60,8 @@ const API = {
         return this._get(`/api/projects/${projectId}/steps/${stepName}/editable`);
     },
 
-    async updateField(projectId, path, value) {
-        return this._put(`/api/projects/${projectId}/state/field`, { path, value });
+    async updateField(projectId, path, value, reset = true) {
+        return this._put(`/api/projects/${projectId}/state/field`, { path, value, reset });
     },
 
     // ─── 项目操作 ────────────────────────────────────────────
@@ -101,11 +101,16 @@ const API = {
 
     fileUrl(projectId, filePath) {
         if (!filePath) return '';
-        // 处理绝对路径 — 提取相对于 outputs/{projectId}/ 的路径
+        // 后端存的是 OS 原始路径，可能混用反斜杠 / 正斜杠、带 ./ 前缀
+        // （如 './outputs\\{id}\\资产/人物/x.png'）。先统一为正斜杠再剥离前缀。
+        let norm = String(filePath).replace(/\\/g, '/').replace(/^\.\//, '');
+        // 剥离 outputs/{projectId}/ 前缀，得到相对项目输出目录的路径
         const pattern = `outputs/${projectId}/`;
-        const idx = filePath.indexOf(pattern);
-        const relative = idx >= 0 ? filePath.substring(idx + pattern.length) : filePath.replace(/\\/g, '/');
-        return `/api/projects/${projectId}/files/${encodeURI(relative)}`;
+        const idx = norm.indexOf(pattern);
+        const relative = idx >= 0 ? norm.substring(idx + pattern.length) : norm;
+        // 按路径段编码，保留 '/' 分隔符（中文目录名需编码）
+        const encoded = relative.split('/').map(encodeURIComponent).join('/');
+        return `/api/projects/${projectId}/files/${encoded}`;
     },
 
     // ─── 内部方法 ────────────────────────────────────────────

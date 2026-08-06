@@ -243,7 +243,12 @@ async def upload_script(project_id: str, file: UploadFile = File(...)):
 
 @app.post("/api/projects/{project_id}/steps/{step_name}/run")
 async def run_step(project_id: str, step_name: str):
-    """执行单个工作流步骤。"""
+    """执行单个工作流步骤。
+
+    预览步骤（解析/资产/分镜/一致性/提示词）通常很快，同步执行并返回结果。
+    生成步骤（generate_videos / merge_videos）可能耗时数分钟，改为后台任务：
+    立即返回 202，前端通过轮询 GET /api/projects/{id} 观察步骤状态。
+    """
     if step_name not in STEP_ORDER:
         raise HTTPException(400, f"未知步骤: {step_name}")
 
@@ -267,6 +272,29 @@ async def run_step(project_id: str, step_name: str):
         if st and st["status"] != "completed":
             raise HTTPException(400, f"请先完成「{prev}」步骤")
 
+    # 标记运行状态并设为 running（同步/异步都先置位，前端立即能看到）
+    running.add(step_name)
+    _running_steps[project_id] = running
+    pm.set_step_status(project_id, step_name, "running")
+    pm.update_project(project_id, status="generating" if step_name in ("generate_videos", "merge_videos") else "editing")
+
+    # 生成步骤：后台执行，立即返回，前端轮询
+    if step_name in ("generate_videos", "merge_videos"):
+        asyncio.create_task(_execute_step(project_id, step_name, p, background=True))
+        return JSONResponse(status_code=202, content={
+            "ok": True, "step": step_name, "status": "running", "async": True,
+        })
+
+    # 预览步骤：同步执行
+    return await _execute_step(project_id, step_name, p)
+
+
+async def _execute_step(project_id: str, step_name: str, p: dict, background: bool = False):
+    """实际执行一个步骤：加载状态 → 运行节点 → 持久化 → 更新状态位。
+
+    同步路径返回结果作为响应；后台路径 background=True，异常只落库为 failed，
+    不抛出 HTTPException（避免未捕获的后台任务异常）。
+    """
     # 加载或创建状态
     state = pm.load_state(project_id)
     if state is None:
@@ -279,11 +307,6 @@ async def run_step(project_id: str, step_name: str):
     if not state.get("input_file_path"):
         state["input_file_path"] = p.get("input_file", "")
     state["episode_id"] = project_id  # 保持输出目录与项目 ID 一致
-
-    # 设置运行状态
-    running.add(step_name)
-    _running_steps[project_id] = running
-    pm.set_step_status(project_id, step_name, "running")
 
     try:
         wf = get_workflow()
@@ -311,10 +334,16 @@ async def run_step(project_id: str, step_name: str):
         logger.error("步骤 %s 执行失败: %s", step_name, e)
         pm.set_step_status(project_id, step_name, "failed", error=str(e))
         pm.update_project(project_id, status="editing")
+        if background:
+            return {"ok": False, "step": step_name, "status": "failed", "errors": [str(e)]}
         raise HTTPException(500, f"步骤执行失败: {e}")
 
     finally:
-        _running_steps.get(project_id, set()).discard(step_name)
+        running = _running_steps.get(project_id)
+        if running is not None:
+            running.discard(step_name)
+            if not running:
+                _running_steps.pop(project_id, None)
 
 
 @app.post("/api/projects/{project_id}/steps/{step_name}/redo")
@@ -376,6 +405,7 @@ async def update_state_field(project_id: str, req: Request):
     body = await req.json()
     field_path = body.get("path", "")
     value = body.get("value")
+    reset_downstream = body.get("reset", True)
 
     if not field_path:
         raise HTTPException(400, "请提供 field path")
@@ -385,7 +415,7 @@ async def update_state_field(project_id: str, req: Request):
         raise HTTPException(404, "项目不存在")
 
     try:
-        result = pm.update_state_field(project_id, field_path, value)
+        result = pm.update_state_field(project_id, field_path, value, reset_downstream=reset_downstream)
         return result
     except Exception as e:
         raise HTTPException(500, f"字段更新失败: {e}")

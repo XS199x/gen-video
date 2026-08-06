@@ -443,11 +443,16 @@ class ProjectManager:
 
         return result
 
-    def update_state_field(self, project_id: str, field_path: str, value: Any) -> Dict[str, Any]:
+    def update_state_field(self, project_id: str, field_path: str, value: Any,
+                           reset_downstream: bool = True) -> Dict[str, Any]:
         """按点号路径更新 WorkflowState 中的某个字段，持久化并返回新的 editable result。
 
         field_path 格式: "character_assets.0.description" 或 "optimized_prompts"
         数字段表示数组索引。
+
+        reset_downstream: 编辑内容会使下游步骤失效，默认清空重置。
+            但「仅调整顺序」（如拖拽排序交换两个镜头）不改变内容语义，
+            应传 False 以避免误清空一致性/提示词等已完成的下游步骤。
         """
         state = self.load_state(project_id)
         if state is None:
@@ -477,7 +482,7 @@ class ProjectManager:
 
         # 标记该步骤已编辑并重置下游
         step_name = self._field_path_to_step(field_path)
-        if step_name:
+        if step_name and reset_downstream:
             # 标记当前步骤和下游
             idx = STEP_NAMES.index(step_name) if step_name in STEP_NAMES else 0
             with self._lock:
