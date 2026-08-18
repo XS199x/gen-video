@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .state import WorkflowState, state_to_dict, state_from_dict, create_initial_state
+from . import lineage
 from .logger import get_logger
 
 logger = get_logger("project_manager")
@@ -23,28 +24,11 @@ DB_DIR = Path("./data")
 UPLOAD_DIR = Path("./uploads")
 PROJECTS_DIR = Path("./projects")
 
-STEP_NAMES = [
-    "parse_docx",
-    "generate_asset_package",
-    "step1_storyboard",
-    "step2_consistency",
-    "step3_optimize_prompts",
-    "generate_videos",
-    "merge_videos",
-]
-
-STEP_LABELS = {
-    "parse_docx": "解析剧本",
-    "generate_asset_package": "生成资产包",
-    "step1_storyboard": "分镜生成",
-    "step2_consistency": "一致性检查",
-    "step3_optimize_prompts": "优化提示词",
-    "generate_videos": "生成视频",
-    "merge_videos": "合并视频",
-}
-
-PREVIEW_STEPS = STEP_NAMES[:5]
-GENERATE_STEPS = STEP_NAMES[5:]
+# 步骤常量统一复用血缘单一权威（src/lineage.py），不再本地维护副本。
+STEP_NAMES = lineage.STEP_ORDER
+STEP_LABELS = lineage.STEP_LABELS
+PREVIEW_STEPS = lineage.PREVIEW_STEPS
+GENERATE_STEPS = lineage.GENERATE_STEPS
 
 
 class ProjectManager:
@@ -94,6 +78,7 @@ class ProjectManager:
                         project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                         step_name   TEXT NOT NULL,
                         status      TEXT NOT NULL DEFAULT 'pending',
+                        stale       INTEGER NOT NULL DEFAULT 0,
                         started_at  TEXT,
                         finished_at TEXT,
                         error       TEXT DEFAULT '',
@@ -101,6 +86,10 @@ class ProjectManager:
                         UNIQUE(project_id, step_name)
                     );
                 """)
+                # 幂等迁移：为早于 stale 列的旧库补列（新库建表已含，不重复）。
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(project_steps)").fetchall()}
+                if "stale" not in cols:
+                    conn.execute("ALTER TABLE project_steps ADD COLUMN stale INTEGER NOT NULL DEFAULT 0")
                 conn.commit()
             finally:
                 conn.close()
@@ -173,7 +162,7 @@ class ProjectManager:
             for row in rows:
                 p = dict(row)
                 steps = conn.execute(
-                    "SELECT step_name, status FROM project_steps WHERE project_id = ? ORDER BY id",
+                    "SELECT step_name, status, stale FROM project_steps WHERE project_id = ? ORDER BY id",
                     (p["id"],),
                 ).fetchall()
                 p["steps"] = [dict(s) for s in steps]
@@ -280,14 +269,14 @@ class ProjectManager:
                 conn.close()
 
     def reset_steps_from(self, project_id: str, step_name: str):
-        """将指定步骤及其后续步骤重置为 pending。"""
+        """将指定步骤及其后续步骤重置为 pending（并清脏，回到干净起点）。"""
         idx = STEP_NAMES.index(step_name) if step_name in STEP_NAMES else 0
         with self._lock:
             conn = self._get_conn()
             try:
                 for sn in STEP_NAMES[idx:]:
                     conn.execute(
-                        "UPDATE project_steps SET status='pending', started_at=NULL, "
+                        "UPDATE project_steps SET status='pending', stale=0, started_at=NULL, "
                         "finished_at=NULL, error='', result_summary='' "
                         "WHERE project_id=? AND step_name=?",
                         (project_id, sn),
@@ -295,6 +284,34 @@ class ProjectManager:
                 conn.execute(
                     "UPDATE projects SET updated_at=?, status='editing' WHERE id=?",
                     (datetime.now().isoformat(), project_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def set_step_stale(self, project_id: str, step_names, stale: bool = True):
+        """结构化脏标记：把一个或多个步骤置脏/清脏。
+
+        step_names 可以是单个步骤名或步骤名列表。脏 = 上游内容已变，
+        该步已生成的产物与最新输入不一致，需要重跑（但产物本身保留）。
+        """
+        if isinstance(step_names, str):
+            step_names = [step_names]
+        if not step_names:
+            return
+        flag = 1 if stale else 0
+        now = datetime.now().isoformat()
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                for sn in step_names:
+                    conn.execute(
+                        "UPDATE project_steps SET stale=? WHERE project_id=? AND step_name=?",
+                        (flag, project_id, sn),
+                    )
+                conn.execute(
+                    "UPDATE projects SET updated_at=? WHERE id=?",
+                    (now, project_id),
                 )
                 conn.commit()
             finally:
@@ -349,8 +366,10 @@ class ProjectManager:
         if step_status:
             result["status"] = step_status["status"]
             result["error"] = step_status.get("error", "")
+            result["stale"] = bool(step_status.get("stale", 0))
         else:
             result["status"] = "pending"
+            result["stale"] = False
 
         if step_name == "parse_docx":
             result["script_length"] = len(state.get("script_content", ""))
@@ -480,58 +499,18 @@ class ProjectManager:
         # 保存
         self.save_state(project_id, state_from_dict(state_dict))
 
-        # 标记该步骤已编辑并重置下游
-        step_name = self._field_path_to_step(field_path)
+        # 数据血缘：编辑属于步骤 N 的字段 → N 及其所有下游步骤标脏（保留产物，不清空）。
+        # 直到用户显式重跑（redo/run confirm）才覆盖并清脏。
+        step_name = lineage.field_to_step(field_path)
         if step_name and reset_downstream:
-            # 标记当前步骤和下游
-            idx = STEP_NAMES.index(step_name) if step_name in STEP_NAMES else 0
-            with self._lock:
-                conn = self._get_conn()
-                try:
-                    now = datetime.now().isoformat()
-                    conn.execute(
-                        "UPDATE project_steps SET result_summary = result_summary || ' [已编辑]' "
-                        "WHERE project_id=? AND step_name=? AND result_summary NOT LIKE '%[已编辑]%'",
-                        (project_id, step_name),
-                    )
-                    for sn in STEP_NAMES[idx + 1:]:
-                        conn.execute(
-                            "UPDATE project_steps SET status='pending', started_at=NULL, "
-                            "finished_at=NULL, error='', result_summary='' "
-                            "WHERE project_id=? AND step_name=?",
-                            (project_id, sn),
-                        )
-                    conn.execute(
-                        "UPDATE projects SET updated_at=?, status='editing' WHERE id=?",
-                        (now, project_id),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
+            affected = lineage.downstream_steps(step_name, include_self=True)
+            self.set_step_stale(project_id, affected, stale=True)
+            self.update_project(project_id, status="editing")
 
-        logger.info("字段已更新: %s/%s", project_id, field_path)
+        logger.info("字段已更新: %s/%s (标脏步骤: %s)",
+                    project_id, field_path,
+                    step_name if (step_name and reset_downstream) else "无")
         return {"ok": True, "path": field_path}
-
-    def _field_path_to_step(self, field_path: str) -> Optional[str]:
-        """将字段路径映射到对应的步骤名。"""
-        mapping = {
-            "script_content": "parse_docx",
-            "parsed_characters": "parse_docx",
-            "parsed_scenes": "parse_docx",
-            "character_assets": "generate_asset_package",
-            "scene_assets": "generate_asset_package",
-            "prop_assets": "generate_asset_package",
-            "shot_groups": "step1_storyboard",
-            "scene_table": "step1_storyboard",
-            "camera_positions": "step1_storyboard",
-            "consistency_anchors": "step2_consistency",
-            "optimized_prompts": "step3_optimize_prompts",
-            "video_segments": "generate_videos",
-        }
-        for prefix, step in mapping.items():
-            if field_path.startswith(prefix):
-                return step
-        return None
 
     def get_editable_result(self, project_id: str, step_name: str) -> Dict[str, Any]:
         """返回步骤的完整可编辑数据，供前端渲染编辑界面。"""

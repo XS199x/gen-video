@@ -9,6 +9,7 @@ from ..state import WorkflowState
 from ..config_manager import ConfigManager
 from ..model_manager import ModelManager
 from ..prompt_manager import PromptManager
+from ..paths import to_project_relative
 from ..logger import get_logger
 
 logger = get_logger("nodes.merge_videos")
@@ -46,7 +47,17 @@ async def merge_videos_node(
             logger.warning("没有已完成的视频片段")
             valid = segments
 
-        video_files = [s["video_path"] for s in valid if s.get("video_path") and os.path.exists(s["video_path"])]
+        # video_path 现在是相对项目根的 posix 路径（路径契约），
+        # 读取前用 output_dir 还原为绝对路径再判存在性。
+        def _abs(vp):
+            if not vp:
+                return None
+            return vp if os.path.isabs(vp) else os.path.join(output_dir, vp)
+
+        video_files = [
+            _abs(s["video_path"]) for s in valid
+            if s.get("video_path") and os.path.exists(_abs(s["video_path"]))
+        ]
         final_path = await _merge(video_files, valid, videos_dir, output_dir)
 
         manifest = {
@@ -64,8 +75,12 @@ async def merge_videos_node(
         with open(mpath, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
 
+        # 路径契约：final_video_path 存规范化的相对 posix 路径
+        episode_id = state.get("episode_id", "unknown")
+        final_path_rel = to_project_relative(str(final_path), episode_id) if final_path else final_path
+
         new_state.update({
-            "videos_merged": True, "final_video_path": final_path,
+            "videos_merged": True, "final_video_path": final_path_rel,
             "output_manifest_path": mpath, "total_segments": len(segments), "valid_segments_count": len(valid),
         })
 

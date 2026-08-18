@@ -3,7 +3,7 @@
  *
  * 布局（参考 Linear/Figma 编辑器范式）:
  *   顶部：面包屑（返回 + 项目标题 + 剧集切换 + 复制）
- *   左侧：窄步骤导航 rail（StepNav）— 常驻状态/耗时/已修改，可自由跳转
+ *   左侧：窄步骤导航 rail（StepNav）— 常驻状态/耗时/过期标记，可自由跳转
  *   主区：单栏聚焦当前选中步骤的内容
  *
  * 生成步骤（generate_videos/merge_videos）作为第 6/7 步的内容出现，
@@ -26,16 +26,6 @@
         { key: 'generate_videos', label: '生成视频', icon: '🎥', desc: '调用视频 API 生成视频片段（付费）', phase: 'generate' },
         { key: 'merge_videos', label: '合并视频', icon: '🎞️', desc: '将所有片段合并为完整视频', phase: 'generate' },
     ];
-
-    const FIELD_TO_STEP = {
-        parsed_characters: 'parse_docx',
-        character_assets: 'generate_asset_package',
-        scene_assets: 'generate_asset_package',
-        prop_assets: 'generate_asset_package',
-        shot_groups: 'step1_storyboard',
-        consistency_anchors: 'step2_consistency',
-        optimized_prompts: 'step3_optimize_prompts',
-    };
 
     window.workflowView = function workflowView(container, projectId) {
         let project = null;
@@ -99,7 +89,10 @@
         function stepStatusMap() {
             const sm = {};
             (project.steps || []).forEach(s => {
-                sm[s.step_name] = { status: s.status, started: s.started_at, finished: s.finished_at, summary: s.result_summary || '' };
+                sm[s.step_name] = {
+                    status: s.status, started: s.started_at, finished: s.finished_at,
+                    summary: s.result_summary || '', stale: !!s.stale,
+                };
             });
             return sm;
         }
@@ -116,7 +109,7 @@
                     key: s.key, label: s.label, icon: s.icon,
                     status: info.status || 'pending',
                     started: info.started, finished: info.finished,
-                    edited: (info.summary || '').includes('[已编辑]'),
+                    stale: !!info.stale,
                 };
             });
             rail.innerHTML = `
@@ -233,7 +226,7 @@
         function makeSaver(reset = true) {
             return async (path, value) => {
                 await API.updateField(projectId, path, value, reset);
-                // 重新拉项目以刷新 rail「已修改」与下游状态
+                // 重新拉项目以刷新 rail「已过期」与下游状态
                 project = await API.getProject(projectId);
                 renderRail();
             };
@@ -641,18 +634,53 @@
         }
 
         // ─── 执行 / 重做（含异步轮询）─────────────────────────────
-        async function runStep(stepName) {
+        // force=true 为幂等逃生阀（全部重生成）；默认增量续跑（只补跑未完成的）。
+        async function runStep(stepName, confirmed = false, force = false) {
             const isGenerate = STEP_DEFS.find(s => s.key === stepName)?.phase === 'generate';
+            const label = STEP_DEFS.find(s => s.key === stepName)?.label || stepName;
             // 立即置为执行中
             const actions = container.querySelector('[data-role="step-actions"]');
             if (actions && activeStep === stepName) actions.innerHTML = stepActionBtn('running');
             const detail = container.querySelector('[data-role="detail"]');
             if (detail && activeStep === stepName && !isGenerate) detail.innerHTML = runningPlaceholder();
 
+            let res;
             try {
-                await API.runStep(projectId, stepName);
+                res = await API.runStep(projectId, stepName, confirmed, force);
             } catch (e) {
                 U().showToast(`${stepName} 执行失败: ${e.message}`, 'error');
+                // 恢复按钮态（失败/取消时不要卡在「执行中」）
+                project = await API.getProject(projectId);
+                renderRail();
+                if (activeStep === stepName) renderMain();
+                return;
+            }
+
+            // 付费墙闸门：后端要求确认（已过期需重跑 / 已有产物将被覆盖）
+            if (res && res.need_confirm) {
+                const est = res.estimate || {};
+                const shots = est.shot_count != null ? est.shot_count : '若干';
+                const cost = est.estimated_cost || '未知';
+                const why = res.reason === 'stale'
+                    ? '上游已修改，当前产物已过期。'
+                    : '该步骤已有产物，重跑将覆盖现有结果。';
+                // 区分逃生阀：force 全量重生成 vs 默认增量续跑（省钱路径）
+                const mode = force
+                    ? '本次为「强制全部重新生成」，将忽略已完成片段、全部重新生成（更贵）。'
+                    : '本次为「增量续跑」，已完成的片段将跳过、只补跑未完成的（更省）。';
+                const ok = confirm(
+                    `「${label}」是付费步骤。\n${why}\n${mode}\n\n` +
+                    `本次最多生成 ${shots} 个镜头，预计花费 ${cost}。\n确认继续？`
+                );
+                if (!ok) {
+                    // 用户取消：还原按钮，不发起执行
+                    project = await API.getProject(projectId);
+                    renderRail();
+                    if (activeStep === stepName) renderMain();
+                    return;
+                }
+                // 确认后带 confirm=true 重发（保留原 force）
+                return runStep(stepName, true, force);
             }
 
             if (isGenerate) {
@@ -697,7 +725,8 @@
             }
             project = await API.getProject(projectId);
             renderRail();
-            await runStep(stepName);
+            // 「重做」语义即全部重来，走 force=true 保持一致
+            await runStep(stepName, false, true);
         }
 
         // ─── 生成阶段内容（并入主区）─────────────────────────────
@@ -769,7 +798,12 @@
                 ${completed.map(s => C().VideoSegment.render(s, { projectId })).join('')}
                 ${pendingUp.map(s => C().VideoSegment.render(s, { projectId })).join('')}
                 </div>
-                ${genStatus === 'failed' ? `<button class="btn btn-warning btn-block mt-4" data-action="retry-videos">🔁 重试视频生成</button>` : ''}`;
+                <div class="btn-row mt-4" style="display:flex;gap:8px;">
+                    <button class="btn btn-primary" style="flex:1;" data-action="resume-videos"
+                        title="已完成片段跳过、只补跑未完成的，保留手动上传">▶ 补跑未完成${failed.length ? `（${failed.length}）` : ''}</button>
+                    <button class="btn btn-warning" style="flex:1;" data-action="regen-videos"
+                        title="忽略已完成、全部重新生成（更贵）">🔁 全部重生成</button>
+                </div>`;
         }
 
         function renderMerge(state, segs, mergeStatus, genStatus) {
@@ -794,7 +828,9 @@
                 const act = e.target.closest('[data-action]')?.dataset.action;
                 if (act === 'gen-videos') runStep('generate_videos');
                 else if (act === 'merge-videos') runStep('merge_videos');
-                else if (act === 'retry-videos') redoStep('generate_videos');
+                else if (act === 'resume-videos') runStep('generate_videos', false, false);  // 增量续跑
+                else if (act === 'regen-videos') runStep('generate_videos', false, true);     // 全部重生成
+                else if (act === 'retry-videos') runStep('generate_videos', false, false);    // 兼容旧入口：补跑
                 else if (act === 'copy') U().copyFromButton(e.target.closest('[data-action]'), e.target.closest('[data-action]').dataset.copy || '', '提示词已复制');
             };
             detailEl.addEventListener('click', onClick);

@@ -21,7 +21,6 @@ class LLMCache:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_size = max_size
-        self._touch_index()
 
     def _make_key(
         self,
@@ -96,11 +95,6 @@ class LLMCache:
             victim = files.pop(0)
             victim.unlink()
             logger.debug("缓存淘汰: %s", victim.stem[:8])
-
-    def _touch_index(self):
-        index = self.cache_dir / "_index.json"
-        if not index.exists():
-            index.write_text("{}")
 
     def clear(self):
         for f in self.cache_dir.glob("*.pkl"):

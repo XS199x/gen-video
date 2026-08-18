@@ -11,6 +11,8 @@ from ..state import WorkflowState, VideoSegment
 from ..config_manager import ConfigManager
 from ..model_manager import ModelManager
 from ..prompt_manager import PromptManager
+from ..paths import to_project_relative
+from .. import reentrancy
 from ..logger import get_logger
 
 logger = get_logger("nodes.generate_videos")
@@ -48,27 +50,54 @@ async def generate_videos_node(
         if not prompts:
             raise RuntimeError("没有可用的提示词，请先完成 step3_optimize_prompts")
 
-        segments = _build_segments(prompts)
+        # 按 segment_id 对齐：已有单元（含状态/产物/pending_upload 手动成果）优先保留，
+        # 新镜头补进来。这样重跑不会丢失上一轮的进度。
+        fresh = _build_segments(prompts)
+        segments = _merge_segments(state.get("video_segments") or [], fresh)
+
         video_config = config_manager.get_node_config("generate_videos")
         provider = video_config.get("video_provider", "kling")
 
-        logger.info("视频生成: %d 个片段, 服务商=%s, 模型=%s",
-                     len(segments), provider, video_config.get("video_model", "kling-v1"))
+        # ── 幂等分流：跳过已完成、只补跑未完成、保留用户手动占位 ──
+        # force 逃生阀通过运行时临时字段 _force_regenerate 传入（见 server._execute_step）。
+        force = bool(state.get("_force_regenerate", False))
+        skip, regen, preserve = reentrancy.partition_units(
+            segments, "video_path", output_dir, force=force)
+        logger.info("视频生成分流: 跳过 %d / 补跑 %d / 保留 %d（force=%s, 服务商=%s, 模型=%s）",
+                     len(skip), len(regen), len(preserve), force,
+                     provider, video_config.get("video_model", "kling-v1"))
 
-        try:
-            if provider == "kling":
-                segments = await _generate_via_kling(segments, videos_dir, video_config)
-            elif provider == "runway":
-                segments = await _generate_via_runway(segments, videos_dir, video_config)
-            elif provider == "mock":
-                segments = await _generate_mock_videos(segments, videos_dir)
-            else:
-                raise RuntimeError(f"未知的视频服务商: '{provider}'，支持: kling, runway, mock")
-        except Exception as e:
-            logger.warning("视频 API 不可用，输出提示词占位: %s", e)
-            _make_placeholder_segments(segments, videos_dir, str(e))
+        if regen:
+            # 补跑前清掉旧的 task_id/error，避免污染本次提交/轮询。
+            for seg in regen:
+                seg.pop("task_id", None)
+                seg.pop("error", None)
+                seg.pop("_api_error", None)
+                seg["status"] = "pending"
+            try:
+                if provider == "kling":
+                    await _generate_via_kling(regen, videos_dir, video_config)
+                elif provider == "runway":
+                    await _generate_via_runway(regen, videos_dir, video_config)
+                elif provider == "mock":
+                    await _generate_mock_videos(regen, videos_dir)
+                else:
+                    raise RuntimeError(f"未知的视频服务商: '{provider}'，支持: kling, runway, mock")
+            except Exception as e:
+                logger.warning("视频 API 不可用，输出提示词占位: %s", e)
+                _make_placeholder_segments(regen, videos_dir, str(e))
+        else:
+            logger.info("没有需要补跑的片段，全部命中缓存或保留。")
+
+        # 路径契约：video_path 统一规范化为相对 posix 路径后再入 state
+        episode_id = state.get("episode_id", "unknown")
+        for seg in segments:
+            if seg.get("video_path"):
+                seg["video_path"] = to_project_relative(str(seg["video_path"]), episode_id)
 
         new_state.update({"videos_generated": True, "video_segments": segments, "video_output_dir": videos_dir})
+        # 运行时临时控制字段，不持久化污染 state
+        new_state.pop("_force_regenerate", None)
 
         mpath = os.path.join(output_dir, "视频片段清单.json")
         with open(mpath, "w", encoding="utf-8") as f:
@@ -102,6 +131,30 @@ def _build_segments(prompts: list) -> List[VideoSegment]:
                 prompt=str(prompt), video_path=None, status="pending", duration=5.0,
             ))
     return segments
+
+
+def _merge_segments(existing: list, fresh: list) -> List[VideoSegment]:
+    """按 segment_id 把已有单元与本轮新建的对齐。
+
+    以 fresh（当前提示词决定的镜头集合与顺序）为骨架：
+      - 已有同 id 的单元 → 沿用其状态/产物/task_id 等（保留上一轮进度与手动成果），
+        但用 fresh 的最新 prompt/shot_id 刷新（提示词可能被上游编辑过）。
+      - 已有里没有的镜头 → 用 fresh 的全新 pending 单元。
+    fresh 里不再存在的旧单元（镜头被删）自然丢弃，保持与当前提示词一致。
+    """
+    by_id = {s.get("segment_id"): s for s in (existing or [])}
+    merged: List[VideoSegment] = []
+    for f in fresh:
+        old = by_id.get(f.get("segment_id"))
+        if old:
+            unit = dict(old)
+            # 提示词/镜头标识以最新为准，其余进度字段沿用旧值
+            unit["prompt"] = f.get("prompt", old.get("prompt"))
+            unit["shot_id"] = f.get("shot_id", old.get("shot_id"))
+            merged.append(unit)
+        else:
+            merged.append(f)
+    return merged
 
 
 def _make_placeholder_segments(segments, videos_dir, error_msg):

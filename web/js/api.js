@@ -44,8 +44,26 @@ const API = {
 
     // ─── 步骤 ────────────────────────────────────────────────
 
-    async runStep(projectId, stepName) {
-        return this._post(`/api/projects/${projectId}/steps/${stepName}/run`);
+    // 执行步骤。付费步骤在「已过期/将覆盖」时后端返回 409 + { need_confirm, estimate }，
+    // 这里不抛错而是原样返回该 body，交由调用方弹确认框；确认后带 confirm=true 重发。
+    // force=true 为幂等逃生阀（忽略跳过、全部重生成）；默认 force=false 增量续跑。
+    async runStep(projectId, stepName, confirm = false, force = false) {
+        const params = [];
+        if (confirm) params.push('confirm=true');
+        if (force) params.push('force=true');
+        const qs = params.length ? `?${params.join('&')}` : '';
+        const resp = await fetch(`/api/projects/${projectId}/steps/${stepName}/run${qs}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+        const body = await resp.json().catch(() => ({}));
+        if (resp.status === 409 && body && body.need_confirm) {
+            return body;  // { need_confirm: true, step, reason, estimate }
+        }
+        if (!resp.ok) {
+            throw new Error(body.detail || `HTTP ${resp.status}`);
+        }
+        return body;
     },
 
     async redoStep(projectId, stepName) {
@@ -99,12 +117,16 @@ const API = {
 
     // ─── 文件 ────────────────────────────────────────────────
 
+    // 把产物路径拼成 HTTP URL。
+    // 契约（见后端 src/paths.py）：后端存入 state 的路径已规范化为
+    // 「相对项目根的 posix 相对路径」（如 资产/char_0.png）。此处主路径即纯拼接。
+    // 下方 indexOf/replace 是对历史脏数据（旧项目未迁移）的防御性兼容 —— 双保险，
+    // 即便某处遗漏规范化也不至于裂图。
     fileUrl(projectId, filePath) {
         if (!filePath) return '';
-        // 后端存的是 OS 原始路径，可能混用反斜杠 / 正斜杠、带 ./ 前缀
-        // （如 './outputs\\{id}\\资产/人物/x.png'）。先统一为正斜杠再剥离前缀。
+        // 统一正斜杠、去掉 ./ 前缀（对干净相对路径为幂等）
         let norm = String(filePath).replace(/\\/g, '/').replace(/^\.\//, '');
-        // 剥离 outputs/{projectId}/ 前缀，得到相对项目输出目录的路径
+        // 兼容历史脏数据：若仍含 outputs/{projectId}/ 前缀则剥离
         const pattern = `outputs/${projectId}/`;
         const idx = norm.indexOf(pattern);
         const relative = idx >= 0 ? norm.substring(idx + pattern.length) : norm;

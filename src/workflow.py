@@ -3,6 +3,7 @@ from .state import WorkflowState, create_initial_state
 from .config_manager import ConfigManager
 from .model_manager import ModelManager
 from .prompt_manager import PromptManager
+from . import lineage
 from .logger import setup_logging, get_logger
 from .nodes.parse_docx import parse_docx_node
 from .nodes.generate_asset_package import generate_asset_package_node
@@ -14,16 +15,13 @@ from .nodes.merge_videos import merge_videos_node
 
 logger = get_logger("workflow")
 
-NODE_NAMES = {
-    "parse_docx": "解析剧本",
-    "generate_asset_package": "生成资产包",
-    "step1_storyboard": "分镜生成",
-    "step2_consistency": "一致性检查",
-    "step3_optimize_prompts": "优化提示词",
-    "generate_videos": "生成视频",
-    "merge_videos": "合并视频",
-}
+# 步骤顺序 / 标签 / 免费付费切分统一复用血缘单一权威（src/lineage.py）。
+NODE_NAMES = lineage.STEP_LABELS
+STEP_ORDER = lineage.STEP_ORDER
+PREVIEW_STEPS = lineage.PREVIEW_STEPS   # 预览阶段（免费）
+GENERATE_STEPS = lineage.GENERATE_STEPS  # 生成阶段（付费）
 
+# NODE_FUNCS 是节点函数映射，属 workflow 职责，保留在本地。
 NODE_FUNCS = {
     "parse_docx": parse_docx_node,
     "generate_asset_package": generate_asset_package_node,
@@ -33,16 +31,6 @@ NODE_FUNCS = {
     "generate_videos": generate_videos_node,
     "merge_videos": merge_videos_node,
 }
-
-STEP_ORDER = [
-    "parse_docx", "generate_asset_package", "step1_storyboard",
-    "step2_consistency", "step3_optimize_prompts", "generate_videos", "merge_videos",
-]
-
-# 预览阶段（免费，不含视频生成和合并）
-PREVIEW_STEPS = STEP_ORDER[:5]  # parse_docx → step3_optimize_prompts
-# 生成阶段（付费）
-GENERATE_STEPS = STEP_ORDER[5:]  # generate_videos, merge_videos
 
 
 class VideoWorkflow:
@@ -60,28 +48,13 @@ class VideoWorkflow:
     def _build_graph(self):
         workflow = StateGraph(WorkflowState)
 
-        for name, func in [
-            ("parse_docx", parse_docx_node),
-            ("generate_asset_package", generate_asset_package_node),
-            ("step1_storyboard", step1_storyboard_node),
-            ("step2_consistency", step2_consistency_node),
-            ("step3_optimize_prompts", step3_optimize_prompts_node),
-            ("generate_videos", generate_videos_node),
-            ("merge_videos", merge_videos_node),
-        ]:
-            workflow.add_node(name, self._wrap_node(name, func))
+        for name in STEP_ORDER:
+            workflow.add_node(name, self._wrap_node(name, NODE_FUNCS[name]))
 
-        workflow.set_entry_point("parse_docx")
-        for a, b in [
-            ("parse_docx", "generate_asset_package"),
-            ("generate_asset_package", "step1_storyboard"),
-            ("step1_storyboard", "step2_consistency"),
-            ("step2_consistency", "step3_optimize_prompts"),
-            ("step3_optimize_prompts", "generate_videos"),
-            ("generate_videos", "merge_videos"),
-        ]:
-            workflow.add_edge(a, b)
-        workflow.add_edge("merge_videos", END)
+        workflow.set_entry_point(STEP_ORDER[0])
+        for i in range(len(STEP_ORDER) - 1):
+            workflow.add_edge(STEP_ORDER[i], STEP_ORDER[i + 1])
+        workflow.add_edge(STEP_ORDER[-1], END)
 
         self.graph = workflow.compile()
 

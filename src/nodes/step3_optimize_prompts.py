@@ -32,6 +32,123 @@ class OptimizedPromptGroup(BaseModel):
     shots: List[OptimizedShot] = Field(default_factory=list, description="该组的所有镜头")
 
 
+def _group_to_markdown(group: Dict) -> str:
+    """将 state 中的单个镜头组序列化为 Markdown，供 LLM 精确对齐每个镜头。
+
+    只序列化该组的镜头，确保 step3 逐组生成时不会遗漏或合并镜头。
+    """
+    lines = []
+    name = group.get("group_name") or group.get("group_id") or "镜头组"
+    lines.append(f"## 镜头组：{name}")
+    if group.get("narrative_function"):
+        lines.append(f"叙事功能：{group['narrative_function']}")
+    if group.get("estimated_duration"):
+        lines.append(f"预计时长：{group['estimated_duration']}")
+    lines.append("")
+    for shot in group.get("shots", []):
+        sid = shot.get("shot_id") or "镜头"
+        lines.append(f"### {sid}")
+        for label, key in (
+            ("景别", "framing"), ("镜头类型", "shot_type"), ("运镜", "camera_movement"),
+            ("画面内容", "content"), ("台词", "dialogue"),
+            ("视觉风格", "visual_style"), ("音效", "audio_notes"),
+        ):
+            if shot.get(key):
+                lines.append(f"- {label}：{shot[key]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+_SYSTEM_JSON = "你是一位专业的AI视频提示词工程师，将分镜脚本转化为用于AI视频生成的精确提示词。只返回有效的JSON。"
+_SYSTEM_TEXT = "你是一位专业的AI视频提示词工程师，将分镜脚本转化为用于AI视频生成的精确提示词。"
+
+
+def _generate_per_group(llm, prompt_manager, base_context: Dict, shot_groups: List[Dict]) -> List[Dict]:
+    """逐个镜头组生成提示词，保证「一个分镜镜头 → 一个提示词」的一一对应。
+
+    每组单独调用一次 LLM，并把该组的镜头列表显式注入上下文，避免结构化 schema
+    把多组压成一组、或遗漏镜头。生成后按源镜头数回填对齐，确保数量不丢。
+    """
+    prompts_data: List[Dict] = []
+    for gi, group in enumerate(shot_groups):
+        src_shots = group.get("shots", []) or []
+        group_name = group.get("group_name") or group.get("group_id") or f"镜头组{gi + 1}"
+        context = dict(base_context)
+        context["current_group"] = _group_to_markdown(group)
+
+        try:
+            messages = prompt_manager.create_messages(
+                "step3_optimize_prompts", context, system_prompt=_SYSTEM_JSON,
+            )
+            logger.info("优化镜头组 %d/%d「%s」(%d 镜)...", gi + 1, len(shot_groups), group_name, len(src_shots))
+            result = llm.generate_structured(messages, OptimizedPromptGroup)
+            group_dict = result.model_dump()
+        except Exception as e:
+            logger.warning("组「%s」结构化输出失败，回退文本解析: %s", group_name, e)
+            optimized_content = llm.generate(prompt_manager.create_messages(
+                "step3_optimize_prompts", context, system_prompt=_SYSTEM_TEXT,
+            ))
+            parsed = _parse_optimized_prompts(optimized_content)
+            group_dict = parsed[0] if parsed else {"group_name": group_name, "shots": []}
+
+        # 保留源分镜的组名，并按源镜头数对齐，防止 LLM 漏镜或改名
+        group_dict["group_name"] = group_name
+        group_dict["shots"] = _align_shots(group_dict.get("shots", []), src_shots)
+        prompts_data.append(group_dict)
+
+    total = sum(len(g.get("shots", [])) for g in prompts_data)
+    logger.info("逐组生成完成: %d 组, %d 个镜头", len(prompts_data), total)
+    return prompts_data
+
+
+def _generate_whole(llm, prompt_manager, context: Dict) -> List[Dict]:
+    """无 shot_groups 时的兜底：整体生成，尽量走文本解析以支持多组。"""
+    try:
+        optimized_content = llm.generate(prompt_manager.create_messages(
+            "step3_optimize_prompts", context, system_prompt=_SYSTEM_TEXT,
+        ))
+        prompts_data = _parse_optimized_prompts(optimized_content)
+        logger.info("整体文本解析完成: %d 组镜头", len(prompts_data))
+        return prompts_data
+    except Exception as e:
+        logger.warning("整体生成失败，回退单组结构化: %s", e)
+        messages = prompt_manager.create_messages(
+            "step3_optimize_prompts", context, system_prompt=_SYSTEM_JSON,
+        )
+        result = llm.generate_structured(messages, OptimizedPromptGroup)
+        return [result.model_dump()]
+
+
+def _align_shots(gen_shots: List[Dict], src_shots: List[Dict]) -> List[Dict]:
+    """按源分镜镜头数对齐生成结果，确保一一对应。
+
+    - LLM 生成的镜头多于源：多余部分丢弃（避免凭空拆镜）。
+    - 少于源：用源分镜的信息回填占位镜头，保证每个源镜头都有对应提示词。
+    """
+    if not src_shots:
+        return gen_shots
+    aligned: List[Dict] = []
+    for i, src in enumerate(src_shots):
+        shot_name = src.get("shot_id") or f"镜头{i + 1}"
+        if i < len(gen_shots) and gen_shots[i]:
+            shot = dict(gen_shots[i])
+            shot.setdefault("shot_name", shot_name)
+            if not shot.get("shot_name"):
+                shot["shot_name"] = shot_name
+        else:
+            # 回填：LLM 未覆盖该镜头，用源分镜信息构造基础提示词
+            shot = {
+                "shot_name": shot_name,
+                "description": src.get("content", ""),
+                "prompt": src.get("prompt") or src.get("content", ""),
+                "dialogue": src.get("dialogue", ""),
+                "visual_style": src.get("visual_style", ""),
+                "audio": src.get("audio_notes", ""),
+            }
+        aligned.append(shot)
+    return aligned
+
+
 async def step3_optimize_prompts_node(
     state: WorkflowState, config_manager: ConfigManager,
     model_manager: ModelManager, prompt_manager: PromptManager,
@@ -56,23 +173,15 @@ async def step3_optimize_prompts_node(
 
         llm = model_manager.get_llm_for_node("step3_optimize_prompts")
 
-        try:
-            messages = prompt_manager.create_messages(
-                "step3_optimize_prompts", context,
-                system_prompt="你是一位专业的AI视频提示词工程师，将分镜脚本转化为用于AI视频生成的精确提示词。只返回有效的JSON。",
+        shot_groups = state.get("shot_groups") or []
+        if shot_groups:
+            prompts_data = _generate_per_group(
+                llm, prompt_manager, context, shot_groups
             )
-            logger.info("调用 LLM 优化视频提示词...")
-            result = llm.generate_structured(messages, OptimizedPromptGroup)
-            prompts_data = [result.model_dump()]
-            logger.info("结构化输出成功: 1 组, %d 个镜头", len(result.shots))
-        except Exception as e:
-            logger.warning("结构化输出失败，回退到文本解析: %s", e)
-            optimized_content = llm.generate(prompt_manager.create_messages(
-                "step3_optimize_prompts", context,
-                system_prompt="你是一位专业的AI视频提示词工程师，将分镜脚本转化为用于AI视频生成的精确提示词。",
-            ))
-            prompts_data = _parse_optimized_prompts(optimized_content)
-            logger.info("文本解析完成: %d 组镜头", len(prompts_data))
+        else:
+            # 无结构化分镜组时的兜底：整体生成单组（历史行为）
+            logger.warning("state 中无 shot_groups，回退到整体单组生成")
+            prompts_data = _generate_whole(llm, prompt_manager, context)
 
         md_content = _markdown_output(prompts_data)
         step3_output_path = os.path.join(output_dir, "优化提示词.md")

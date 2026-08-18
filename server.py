@@ -31,7 +31,6 @@ API:
 
 import asyncio
 import os
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -40,9 +39,11 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
-from src.workflow import VideoWorkflow, PREVIEW_STEPS, STEP_ORDER
-from src.state import WorkflowState, state_to_dict, create_initial_state
+from src.workflow import VideoWorkflow, STEP_ORDER
+from src.state import WorkflowState, create_initial_state
 from src.project_manager import get_project_manager
+from src.paths import to_project_relative
+from src import lineage
 from src.logger import get_logger, setup_logging
 
 setup_logging("INFO")
@@ -242,12 +243,18 @@ async def upload_script(project_id: str, file: UploadFile = File(...)):
 # ═══════════════════════════════════════════════════════════════════
 
 @app.post("/api/projects/{project_id}/steps/{step_name}/run")
-async def run_step(project_id: str, step_name: str):
+async def run_step(project_id: str, step_name: str, confirm: bool = False, force: bool = False):
     """执行单个工作流步骤。
 
     预览步骤（解析/资产/分镜/一致性/提示词）通常很快，同步执行并返回结果。
     生成步骤（generate_videos / merge_videos）可能耗时数分钟，改为后台任务：
     立即返回 202，前端通过轮询 GET /api/projects/{id} 观察步骤状态。
+
+    付费墙闸门：付费步骤（GENERATE_STEPS）在「已过期(stale)」或「已有产物将被覆盖」
+    时，若未带 confirm=true，则拦截并返回 409 + 成本预估，由前端弹确认框。
+
+    幂等续跑：默认（force=false）增量续跑——已完成且产物存在的单元跳过，只补跑
+    未完成的，保留用户手动上传的成果。force=true 为逃生阀，忽略幂等全部重生成。
     """
     if step_name not in STEP_ORDER:
         raise HTTPException(400, f"未知步骤: {step_name}")
@@ -272,6 +279,21 @@ async def run_step(project_id: str, step_name: str):
         if st and st["status"] != "completed":
             raise HTTPException(400, f"请先完成「{prev}」步骤")
 
+    # ── 付费墙闸门 ────────────────────────────────────────────────
+    # 付费步骤在会重复花钱（已过期 stale，或已有产物将被覆盖）时，先请前端确认。
+    if lineage.is_paid_step(step_name) and not confirm:
+        st = pm.get_step_status(project_id, step_name)
+        is_stale = bool(st and st.get("stale"))
+        has_output = bool(st and st.get("status") == "completed")
+        if is_stale or has_output:
+            estimate = pm.estimate_cost(project_id)
+            return JSONResponse(status_code=409, content={
+                "need_confirm": True,
+                "step": step_name,
+                "reason": "stale" if is_stale else "overwrite",
+                "estimate": estimate,
+            })
+
     # 标记运行状态并设为 running（同步/异步都先置位，前端立即能看到）
     running.add(step_name)
     _running_steps[project_id] = running
@@ -280,20 +302,23 @@ async def run_step(project_id: str, step_name: str):
 
     # 生成步骤：后台执行，立即返回，前端轮询
     if step_name in ("generate_videos", "merge_videos"):
-        asyncio.create_task(_execute_step(project_id, step_name, p, background=True))
+        asyncio.create_task(_execute_step(project_id, step_name, p, background=True, force=force))
         return JSONResponse(status_code=202, content={
             "ok": True, "step": step_name, "status": "running", "async": True,
         })
 
     # 预览步骤：同步执行
-    return await _execute_step(project_id, step_name, p)
+    return await _execute_step(project_id, step_name, p, force=force)
 
 
-async def _execute_step(project_id: str, step_name: str, p: dict, background: bool = False):
+async def _execute_step(project_id: str, step_name: str, p: dict, background: bool = False, force: bool = False):
     """实际执行一个步骤：加载状态 → 运行节点 → 持久化 → 更新状态位。
 
     同步路径返回结果作为响应；后台路径 background=True，异常只落库为 failed，
     不抛出 HTTPException（避免未捕获的后台任务异常）。
+
+    force=true 时通过运行时临时字段 state["_force_regenerate"] 透传给节点，
+    触发幂等逃生阀（忽略跳过、全部重生成）。节点执行后会 pop 掉该字段。
     """
     # 加载或创建状态
     state = pm.load_state(project_id)
@@ -308,6 +333,10 @@ async def _execute_step(project_id: str, step_name: str, p: dict, background: bo
         state["input_file_path"] = p.get("input_file", "")
     state["episode_id"] = project_id  # 保持输出目录与项目 ID 一致
 
+    # force 逃生阀：通过运行时临时字段透传给节点（节点读后会 pop，不持久化）
+    if force:
+        state["_force_regenerate"] = True
+
     try:
         wf = get_workflow()
         state = await wf.run_step(step_name, state)
@@ -320,6 +349,8 @@ async def _execute_step(project_id: str, step_name: str, p: dict, background: bo
             pm.set_step_status(project_id, step_name, "failed", error=error_msg)
         else:
             pm.set_step_status(project_id, step_name, "completed")
+            # 重跑成功 → 该步产物已刷新，清除其脏标记。
+            pm.set_step_stale(project_id, step_name, stale=False)
 
         pm.update_project(project_id, status="editing")
 
@@ -435,24 +466,14 @@ async def duplicate_project(project_id: str, req: Request):
 
 
 def clear_state_from_step(state: WorkflowState, step_name: str) -> WorkflowState:
-    """清除指定步骤及之后步骤产生的状态字段。"""
-    idx = STEP_ORDER.index(step_name) if step_name in STEP_ORDER else 0
-    steps_to_clear = STEP_ORDER[idx:]
+    """清除指定步骤及之后步骤产生的状态字段。
 
-    clear_map = {
-        "parse_docx": ["script_content", "structured_script", "parsed_characters", "parsed_scenes", "parsed_props"],
-        "generate_asset_package": ["assets_generated", "character_assets", "scene_assets", "prop_assets",
-                                     "asset_prompts", "asset_table_path", "images_generated"],
-        "step1_storyboard": ["step1_completed", "scene_table", "camera_positions", "opening_state",
-                              "shot_groups", "step1_output_path", "step1_optimized_path"],
-        "step2_consistency": ["step2_completed", "consistency_anchors", "step2_output_path"],
-        "step3_optimize_prompts": ["step3_completed", "optimized_prompts", "step3_output_path"],
-        "generate_videos": ["videos_generated", "video_segments", "video_output_dir"],
-        "merge_videos": ["videos_merged", "final_video_path"],
-    }
+    字段归属复用血缘单一权威 lineage.STEP_OUTPUT_FIELDS，不再本地维护 clear_map。
+    """
+    steps_to_clear = lineage.downstream_steps(step_name, include_self=True)
 
     for sn in steps_to_clear:
-        for field in clear_map.get(sn, []):
+        for field in lineage.STEP_OUTPUT_FIELDS.get(sn, []):
             if field in state:
                 if isinstance(state[field], bool):
                     state[field] = False
@@ -504,12 +525,17 @@ async def upload_asset_image(project_id: str, category: str = Form(...), index: 
     with open(filepath, "wb") as f:
         f.write(content)
 
-    # 更新状态
-    assets[index]["image_path"] = str(filepath)
+    # 更新状态 — 存规范化的相对 posix 路径（路径契约），而非 OS 原始路径
+    assets[index]["image_path"] = to_project_relative(str(filepath), project_id)
     assets[index]["image_generated"] = True
     assets[index]["image_status"] = "manual_upload"
     pm.save_state(project_id, state)
     pm.update_project(project_id, updated_at=datetime.now().isoformat())
+
+    # 血缘：手动替换资产图 → 下游步骤失效（图刚上传是最新，故 include_self=False）。
+    pm.set_step_stale(project_id,
+                      lineage.downstream_steps("generate_asset_package", include_self=False),
+                      stale=True)
 
     logger.info("手动上传资产图片: %s/%s[%d] -> %s", project_id, category, index, filepath)
     return {"ok": True, "path": str(filepath)}
@@ -546,10 +572,16 @@ async def upload_video_segment(project_id: str, segment_id: str = Form(...),
     with open(filepath, "wb") as f:
         f.write(content)
 
-    target["video_path"] = str(filepath)
+    # 存规范化的相对 posix 路径（路径契约），而非 OS 原始路径
+    target["video_path"] = to_project_relative(str(filepath), project_id)
     target["status"] = "completed"
     pm.save_state(project_id, state)
     pm.update_project(project_id, updated_at=datetime.now().isoformat())
+
+    # 血缘：手动补充/替换视频片段 → 合并步骤失效，需重新合并成片。
+    pm.set_step_stale(project_id,
+                      lineage.downstream_steps("generate_videos", include_self=False),
+                      stale=True)
 
     logger.info("手动上传视频片段: %s/%s -> %s", project_id, segment_id, filepath)
     return {"ok": True, "path": str(filepath)}
@@ -573,11 +605,21 @@ async def estimate_cost(project_id: str):
 
 @app.get("/api/projects/{project_id}/files/{file_path:path}")
 async def serve_project_file(project_id: str, file_path: str):
-    """提供项目输出目录中的文件（图片、视频等）。"""
-    output_dir = Path("./outputs") / project_id
-    full_path = output_dir / file_path
+    """提供项目输出目录中的文件（图片、视频等）。
 
-    if not full_path.exists():
+    路径契约：写入端已把 file_path 收口为干净的相对 posix 路径。这里作为消费端，
+    再用 resolve() + relative_to() 兜底，杜绝 ../ 穿越逃出项目输出目录。
+    """
+    output_dir = (Path("./outputs") / project_id).resolve()
+    full_path = (output_dir / file_path).resolve()
+
+    # 安全检查：确保解析后的真实路径仍在项目输出目录之下
+    try:
+        full_path.relative_to(output_dir)
+    except ValueError:
+        raise HTTPException(404, "文件不存在")
+
+    if not full_path.is_file():
         raise HTTPException(404, "文件不存在")
 
     return FileResponse(str(full_path))

@@ -117,6 +117,8 @@ class WorkflowState(TypedDict, total=False):
 
 
 def create_initial_state(episode_id: str, episode_title: str, input_file_path: str) -> WorkflowState:
+    # 注：`_force_regenerate` 是运行时临时控制字段（幂等逃生阀），由 server._execute_step
+    # 在执行前按需注入、节点入口读取后 pop，不属于产物语义，故不在此处初始化、不持久化。
     return WorkflowState(
         episode_id=episode_id,
         episode_title=episode_title,
